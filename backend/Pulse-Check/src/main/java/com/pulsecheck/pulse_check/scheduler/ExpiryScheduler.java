@@ -12,6 +12,8 @@ import java.time.Instant;
 @Component
 public class ExpiryScheduler {
 
+    private static final long GRACE_PERIOD_SECONDS = 5;
+
     private final MonitorService monitorService;
     private final AlertService alertService;
 
@@ -27,7 +29,7 @@ public class ExpiryScheduler {
                 continue;
             }
             long elapsed = Duration.between(monitor.getLastHeartbeat(), Instant.now()).getSeconds();
-            if (elapsed >= monitor.getTimeoutSeconds()) {
+            if (elapsed >= monitor.getTimeoutSeconds() + GRACE_PERIOD_SECONDS) {
                 monitor.setStatus(Monitor.Status.DOWN);
                 alertService.fireDownAlert(monitor);
             }
