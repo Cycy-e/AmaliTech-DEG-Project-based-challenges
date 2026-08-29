@@ -1,156 +1,127 @@
-# Pulse-Check-API ("Watchdog" Sentinel)
+# Pulse-Check API ("Watchdog" Sentinel)
 
-This challenge is designed to test your ability to bridge Computer Science fundamentals with Modern Backend Engineering.
+A dead man's switch service for monitoring remote devices with unreliable connectivity. Devices register a timeout window and send periodic heartbeats; if a device goes silent past its window, the system flags it as down and fires an alert.
 
-## 1. Business Context
+Built for CritMon Servers Inc. to replace manual log-checking for solar farm and weather station uptime.
 
-> **Client:** _CritMon Servers Inc._ (A Critical Infrastructure Monitoring Company).
+## Architecture Diagram
 
-### The Problem
+```mermaid
+sequenceDiagram
+    participant Device
+    participant API as Pulse-Check API
+    participant Scheduler as ExpiryScheduler
+    participant Store as Monitor Store
 
-CritMon provides monitoring for remote solar farms and unmanned weather stations in areas with poor connectivity. These devices are supposed to send "I'm alive" signals every hour.
+    Device->>API: POST /monitors {id, timeout, alertEmail}
+    API->>Store: save Monitor (status=ACTIVE)
+    API-->>Device: 201 Created
 
-Currently, CritMon has no way of knowing if a device has gone offline (due to power failure or theft) until a human manually checks the logs. They need a system that alerts _them_ when a device _stops_ talking.
+    loop every 1s
+        Scheduler->>Store: check all ACTIVE monitors
+        alt heartbeat received in time
+            Device->>API: POST /monitors/{id}/heartbeat
+            API->>Store: reset lastHeartbeat, status=ACTIVE
+            API-->>Device: 200 OK
+        else timeout + grace period exceeded
+            Scheduler->>Store: set status=DOWN
+            Scheduler->>Scheduler: fire alert (log + history)
+        end
+    end
 
-### The Solution
+    Device->>API: POST /monitors/{id}/pause
+    API->>Store: status=PAUSED
+    API-->>Device: 200 OK
+    Note over Scheduler: PAUSED monitors are skipped
+```
 
-You need to build a **Dead Man’s Switch API**. Devices will register a "monitor" with a countdown timer (e.g., 60 seconds). If the device fails to "ping" (send a heartbeat) to the API before the timer runs out, the system automatically triggers an alert.
+## Setup Instructions
 
----
+**Requirements:** Java 21, Maven (or use the bundled wrapper)
 
-## 2. Technical Objective
+```bash
+git clone https://github.com/Cycy-e/AmaliTech-DEG-Project-based-challenges.git
+cd AmaliTech-DEG-Project-based-challenges/backend/Pulse-Check
+./mvnw spring-boot:run          # Mac/Linux
+.\mvnw.cmd spring-boot:run      # Windows
+```
 
-Build a backend service that manages stateful timers.
+Server starts on `http://localhost:8080`.
 
-- **Registration:** Allow a client to create a monitor with a specific timeout duration.
-- **Heartbeat:** Reset the countdown when a ping is received.
-- **Trigger:** Fire a webhook (or log a critical error) if the countdown reaches zero.
+## API Documentation
 
----
+### Register a monitor
+```
+POST /monitors
+Content-Type: application/json
 
-## 3. Getting Started
+{
+  "id": "device-123",
+  "timeout": 60,
+  "alertEmail": "admin@critmon.com"
+}
+```
+**Response:** `201 Created`
+```json
+{ "message": "Monitor device-123 registered" }
+```
 
-1.  **Fork this Repository:** Do not clone it directly. Create a fork to your own GitHub account.
-2.  **Environment:** You may use **Node.js, Python, Java or Go, etc.**.
-3.  **Submission:** Your final submission will be a link to your forked repository containing:
-    - The source code.
-    - The **Architecture Diagram**
-    - The `README.md` with documentation.
+### Send a heartbeat
+```
+POST /monitors/{id}/heartbeat
+```
+Resets the countdown. Also un-pauses a paused monitor.
 
----
+**Response:** `200 OK` or `404 Not Found` if the id doesn't exist.
 
-## 4. The Architecture Diagram
+### Pause a monitor
+```
+POST /monitors/{id}/pause
+```
+Stops the countdown entirely — no alerts fire while paused. Calling `heartbeat` resumes it.
 
-**Task:** Before you write any code, you must design the logic flow.
-**Deliverable:** A **Sequence Diagram** or **State Flowchart** embedded in your `README.md`.
+**Response:** `200 OK` or `404 Not Found`.
 
----
+### List all monitors
+```
+GET /monitors
+```
+Returns the full state of every registered monitor, including current `status`.
 
-## 5. User Stories & Acceptance Criteria
+### Get one monitor
+```
+GET /monitors/{id}
+```
+**Response:** `200 OK` with the monitor object, or `404 Not Found`.
 
-### User Story 1: Registering a Monitor
+### View alert history
+```
+GET /monitors/alerts
+```
+Returns a list of every alert fired since the server started, in the format:
+```json
+{"ALERT": "Device device-123 is down!", "time": "2026-08-29T17:48:58Z"}
+```
 
-**As a** device administrator,
-**I want to** create a new monitor for my device,
-**So that** the system knows to track its status.
+## Design Decisions
 
-**Acceptance Criteria:**
+- **In-memory storage (`ConcurrentHashMap`)** — sufficient for this scope and avoids the overhead of standing up a database. Chosen `ConcurrentHashMap` specifically because the scheduler thread and HTTP request threads both read/write monitor state concurrently.
+- **Polling scheduler (`@Scheduled`, 1-second interval)** over a per-monitor timer thread — simpler to reason about, easier to test, and scales fine at this problem's size. A per-device thread approach would be harder to manage cleanly as monitor count grows.
+- **Separated `MonitorService` and `AlertService`** — state management and notification are different responsibilities. This also means swapping console logging for a real email/webhook integration later only touches one class.
+- **`Optional<Monitor>` for lookups** — forces explicit handling of the "not found" case instead of risking null pointer errors.
 
-- [ ] The API accepts a `POST /monitors` request.
-- [ ] Input: `{"id": "device-123", "timeout": 60, "alert_email": "admin@critmon.com"}`.
-- [ ] The system starts a countdown timer for 60 seconds associated with `device-123`.
-- [ ] Response: `201 Created` with a confirmation message.
+## Developer's Choice: Grace Period Tolerance
 
-### User Story 2: The Heartbeat (Reset)
+**The problem:** The original spec fires a DOWN alert the instant a monitor's timeout is exceeded — even by a single second. But per the brief, CritMon's devices operate in **areas with poor connectivity** (remote solar farms, unmanned weather stations). In that environment, a single missed heartbeat is far more likely to be a transient network hiccup than an actual failure.
 
-**As a** remote device,
-**I want to** send a signal to the server,
-**So that** my timer is reset and no alert is sent.
+**Why it matters:** Without tolerance for this, the system would generate frequent false alarms. In real operations, this leads to alert fatigue — support engineers start ignoring notifications, which quietly defeats the entire purpose of a dead man's switch. A monitoring system that cries wolf is worse than one with slightly slower detection.
 
-**Acceptance Criteria:**
+**What I built:** A 5-second grace period added on top of each monitor's configured timeout before a DOWN alert fires. A device isn't marked down until `timeout + 5s` of silence, giving genuine transient lag a chance to resolve while still detecting real outages promptly. This mirrors patterns used in production systems like Kubernetes liveness probes and PagerDuty escalation delays, for the same underlying reason.
 
-- [ ] The API accepts a `POST /monitors/{id}/heartbeat` request.
-- [ ] If the ID exists and the timer has NOT expired:
-  - [ ] Restart the countdown from the beginning (e.g., reset to 60 seconds).
-  - [ ] Return `200 OK`.
-- [ ] If the ID does not exist:
-  - [ ] Return `404 Not Found`.
+**Additional improvements included:**
+- `GET /monitors` and `GET /monitors/{id}` — the original spec had no way to read monitor state back, which is a significant gap for a monitoring product whose entire value is visibility.
+- `GET /monitors/alerts` — an in-memory alert history, so past alerts aren't lost the moment they scroll out of the console log.
 
-### User Story 3: The Alert (Failure State)
+## Tech Stack
 
-**As a** support engineer,
-**I want to** be notified immediately if a device stops sending heartbeats,
-**So that** I can deploy a repair team.
-
-**Acceptance Criteria:**
-
-- [ ] If the timer for `device-123` reaches 0 seconds (no heartbeat received):
-  - [ ] The system must internally "fire" an alert.
-  - [ ] **Implementation:** For this project, simply `console.log` a JSON object: `{"ALERT": "Device device-123 is down!", "time": <timestamp>}`. (Or simulate sending an email).
-  - [ ] The monitor status changes to `down`.
-
----
-
-## 6. Bonus User Story (The "Snooze" Button)
-
-**As a** maintenance technician,
-**I want to** pause monitoring while I am repairing a device,
-**So that** I don't trigger false alarms.
-
-**Acceptance Criteria:**
-
-- [ ] Create a `POST /monitors/{id}/pause` endpoint.
-- [ ] When called, the timer stops completely. No alerts will fire.
-- [ ] Calling the heartbeat endpoint again automatically "un-pauses" the monitor and restarts the timer.
-
----
-
-## 7. The "Developer's Choice" Challenge
-
-We value engineers who look for "what's missing."
-
-**Task:** Identify **one** additional feature that makes this system more robust or user-friendly.
-
-1.  **Implement it.**
-2.  **Document it:** Explain _why_ you added it in your README.
-
----
-
-## 8. Documentation Requirements
-
-Your final `README.md` must replace these instructions. It must cover:
-
-1.  **Architecture Diagram**
-2.  **Setup Instructions**
-3.  **API Documentation**
-4.  **The Developer's Choice:** Explanation of your added feature.
-
----
-
-Submit your repo link via the [online](https://forms.cloud.microsoft/e/bLyGT3byxx) form.
-
-## 🛑 Pre-Submission Checklist
-
-**WARNING:** Before you submit your solution, you **MUST** pass every item on this list.
-If you miss any of these critical steps, your submission will be **automatically rejected** and you will **NOT** be invited to an interview.
-
-### 1. 📂 Repository & Code
-
-- [ ] **Public Access:** Is your GitHub repository set to **Public**? (We cannot review private repos).
-- [ ] **Clean Code:** Did you remove unnecessary files (like `node_modules`, `.env` with real keys, or `.DS_Store`)?
-- [ ] **Run Check:** if we clone your repo and run `npm start` (or equivalent), does the server start immediately without crashing?
-
-### 2. 📄 Documentation (Crucial)
-
-- [ ] **Architecture Diagram:** Did you include a visual Diagram (Flowchart or Sequence Diagram) in the README?
-- [ ] **README Swap:** Did you **DELETE** the original instructions (the problem brief) from this file and replace it with your own documentation?
-- [ ] **API Docs:** Is there a clear list of Endpoints and Example Requests in the README?
-
-### 3. 🧹 Git Hygiene
-
-- [ ] **Commit History:** Does your repo have multiple commits with meaningful messages? (A single "Initial Commit" is a red flag).
-
----
-
-**Ready?**
-If you checked all the boxes above, submit your repository link in the application form. Good luck! 🚀
+Java 21, Spring Boot 4.1.1, Maven.
