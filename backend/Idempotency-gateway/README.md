@@ -60,7 +60,7 @@ sequenceDiagram
 **Requirements:** Java 21, Maven 3.8+
 
 ```bash
-git clone https://github.com/<your-username>/AmaliTech-DEG-Project-based-challenges.git
+git clone https://github.com/Cycy-e/AmaliTech-DEG-Project-based-challenges.git
 cd AmaliTech-DEG-Project-based-challenges/backend/Idempotency-gateway
 
 # start the server (runs on http://localhost:8080)
